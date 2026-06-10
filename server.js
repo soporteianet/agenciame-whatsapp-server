@@ -122,6 +122,8 @@ async function iniciarSesion(empresaId) {
       sesionData.qrBase64 = null;
       const numero = sock.user?.id?.split(':')[0] || '';
       sesionData.numero   = numero;
+      // Marcar timestamp de conexion para ignorar mensajes anteriores
+      sesionData.connectedAt = Date.now();
 
       // Actualizar Firestore: conectado
       await db.collection('empresas').doc(empresaId).update({
@@ -172,10 +174,16 @@ async function iniciarSesion(empresaId) {
       if (from === 'status@broadcast')      continue; // estados
       if (from.endsWith('@broadcast'))      continue; // broadcasts
 
-      // ❌ Ignorar mensajes muy antiguos (mas de 60 segundos)
+      // ❌ Ignorar mensajes muy antiguos (mas de 60 segundos absolutos)
       const msgTimestamp = msg.messageTimestamp;
       if (msgTimestamp && Date.now() / 1000 - msgTimestamp > 60) {
-        console.log(`[${empresaId}] Mensaje antiguo ignorado: ${new Date(msgTimestamp * 1000).toISOString()}`);
+        console.log(`[${empresaId}] Mensaje antiguo ignorado`);
+        continue;
+      }
+
+      // ❌ Ignorar mensajes anteriores a la conexion de esta sesion
+      if (sesionData.connectedAt && msgTimestamp * 1000 < sesionData.connectedAt) {
+        console.log(`[${empresaId}] Mensaje previo a la conexion ignorado`);
         continue;
       }
 
@@ -366,7 +374,48 @@ app.post('/enviar', auth, async (req, res) => {
   }
 });
 
-// ── Iniciar servidor ──────────────────────────────────────────────────────
+// GET /sesiones — listar todas las sesiones activas (para debug)
+app.get('/sesiones', auth, (req, res) => {
+  const lista = [...sesiones.entries()].map(([id, s]) => ({
+    empresaId: id,
+    status:    s.status,
+    numero:    s.numero,
+  }));
+  // Tambien listar carpetas en disco
+  const sessionDir = path.join(__dirname, 'sessions');
+  const enDisco = fs.existsSync(sessionDir) ? fs.readdirSync(sessionDir) : [];
+  res.json({ enMemoria: lista, enDisco });
+});
+
+// DELETE /sesion/:empresaId — eliminar sesion completamente (numero incluido)
+app.delete('/sesion/:empresaId', auth, async (req, res) => {
+  const { empresaId } = req.params;
+  const sesion = sesiones.get(empresaId);
+  if (sesion?.sock) {
+    try { await sesion.sock.logout(); } catch {}
+  }
+  fs.rmSync(path.join(__dirname, 'sessions', empresaId), { recursive: true, force: true });
+  sesiones.delete(empresaId);
+  await db.collection('empresas').doc(empresaId).update({
+    'whatsapp.status': 'disconnected',
+    'whatsapp.numero': null,
+  }).catch(() => {});
+  res.json({ ok: true, eliminado: empresaId });
+});
+
+// DELETE /sesiones/todas — eliminar TODAS las sesiones (reset total)
+app.delete('/sesiones/todas', auth, async (req, res) => {
+  const sessionDir = path.join(__dirname, 'sessions');
+  const ids = fs.existsSync(sessionDir) ? fs.readdirSync(sessionDir) : [];
+  for (const id of ids) {
+    const sesion = sesiones.get(id);
+    if (sesion?.sock) { try { await sesion.sock.logout(); } catch {} }
+    fs.rmSync(path.join(sessionDir, id), { recursive: true, force: true });
+    sesiones.delete(id);
+  }
+  res.json({ ok: true, eliminadas: ids });
+});
+
 app.listen(PORT, async () => {
   console.log(`agencIAme WhatsApp Server corriendo en puerto ${PORT}`);
   await restaurarSesiones();
