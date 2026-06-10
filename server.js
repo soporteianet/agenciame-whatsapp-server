@@ -30,7 +30,7 @@ const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://nexoia-soporteia
 // ── Sesiones en memoria ───────────────────────────────────────────────────
 // Map: empresaId -> { sock, status, qr, qrBase64, mensajesPendientes }
 const sesiones = new Map();
-const msgCache = new NodeCache({ stdTTL: 60 }); // evita duplicados
+const msgCache = new NodeCache({ stdTTL: 300 }); // 5 minutos — evita duplicados tras reinicios
 const logger   = pino({ level: 'warn' }); // silencioso en produccion
 
 // ── Express ───────────────────────────────────────────────────────────────
@@ -161,59 +161,68 @@ async function iniciarSesion(empresaId) {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      if (msg.key.fromMe) continue; // ignorar mensajes propios
+      // ❌ Ignorar mensajes propios (enviados por el bot)
+      if (msg.key.fromMe) continue;
       if (!msg.message)   continue;
 
-      // Evitar procesar el mismo mensaje dos veces
+      // ❌ Ignorar mensajes de sistema, grupos y broadcasts
+      const from = msg.key.remoteJid;
+      if (!from) continue;
+      if (from.endsWith('@g.us'))           continue; // grupos
+      if (from === 'status@broadcast')      continue; // estados
+      if (from.endsWith('@broadcast'))      continue; // broadcasts
+
+      // ❌ Ignorar mensajes muy antiguos (mas de 60 segundos)
+      const msgTimestamp = msg.messageTimestamp;
+      if (msgTimestamp && Date.now() / 1000 - msgTimestamp > 60) {
+        console.log(`[${empresaId}] Mensaje antiguo ignorado: ${new Date(msgTimestamp * 1000).toISOString()}`);
+        continue;
+      }
+
+      // ❌ Evitar procesar el mismo mensaje dos veces
       const msgId = msg.key.id;
-      if (msgCache.get(msgId)) continue;
+      if (!msgId) continue;
+      if (msgCache.get(msgId)) {
+        console.log(`[${empresaId}] Mensaje duplicado ignorado: ${msgId}`);
+        continue;
+      }
       msgCache.set(msgId, true);
 
-      const from   = msg.key.remoteJid;
-      const isGroup = from.endsWith('@g.us');
-      if (isGroup) continue; // ignorar grupos por ahora
-
-      // Extraer texto del mensaje
+      // Extraer texto
       const texto =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
         msg.message?.buttonsResponseMessage?.selectedButtonId ||
         msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+        msg.message?.imageMessage?.caption ||
         '';
 
-      if (!texto) continue;
+      if (!texto || texto.trim().length === 0) continue;
 
       const numeroCliente = from.replace('@s.whatsapp.net', '');
-      console.log(`[${empresaId}] Mensaje de ${numeroCliente}: ${texto.substring(0, 50)}`);
+      console.log(`[${empresaId}] Mensaje de ${numeroCliente}: ${texto.substring(0, 60)}`);
 
-      // Enviar a la API de agencIAme para procesar con IA
+      // Enviar a la API de agencIAme
       try {
         const resp = await axios.post(
           `${AGENCIAME_API}/api/whatsapp-baileys`,
-          {
-            empresaId,
-            numeroCliente,
-            texto,
-            msgId,
-          },
-          {
-            headers: { 'x-server-secret': SERVER_SECRET },
-            timeout: 25000,
-          }
+          { empresaId, numeroCliente, texto, msgId },
+          { headers: { 'x-server-secret': SERVER_SECRET }, timeout: 25000 }
         );
 
         const respuesta = resp.data?.respuesta;
-        if (respuesta) {
-          // Enviar respuesta por WhatsApp
+        if (respuesta && respuesta.trim().length > 0) {
           await sock.sendMessage(from, { text: respuesta });
           console.log(`[${empresaId}] Respuesta enviada a ${numeroCliente}`);
         }
       } catch (err) {
-        console.error(`[${empresaId}] Error procesando mensaje:`, err.message);
-        // Mensaje de fallback si la IA falla
-        await sock.sendMessage(from, {
-          text: 'En este momento no puedo procesar tu mensaje. Por favor intenta en unos minutos.',
-        });
+        console.error(`[${empresaId}] Error:`, err.message);
+        // Solo enviar fallback si NO es un error de la IA (para no spamear)
+        if (err.code !== 'ECONNABORTED' && err.response?.status !== 500) {
+          await sock.sendMessage(from, {
+            text: 'En este momento no puedo procesar tu mensaje. Por favor intenta en unos minutos.',
+          });
+        }
       }
     }
   });
