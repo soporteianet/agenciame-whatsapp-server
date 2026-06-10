@@ -1,5 +1,5 @@
 // server.js — agencIAme WhatsApp Multi-Empresa Server
-// Cada empresa tiene su propia sesion Baileys identificada por empresaId
+// Persistencia de sesiones en Firestore (sin volumen en Railway)
 
 import express from 'express';
 import cors from 'cors';
@@ -15,49 +15,61 @@ import path from 'path';
 import fs from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
+const require   = createRequire(import.meta.url);
 
-// ── Firebase Admin ────────────────────────────────────────────────────────
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
 
-// ── Config ────────────────────────────────────────────────────────────────
 const PORT          = process.env.PORT || 3001;
-const SERVER_SECRET = process.env.SERVER_SECRET || 'agenciame2026secret';
+const SERVER_SECRET = process.env.SERVER_SECRET || 'agenciame2026secreto_nexoia';
 const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://nexoia-soporteias-projects.vercel.app';
 
-// ── Sesiones en memoria ───────────────────────────────────────────────────
-// Map: empresaId -> { sock, status, qr, qrBase64, mensajesPendientes }
 const sesiones = new Map();
-const msgCache = new NodeCache({ stdTTL: 300 }); // 5 minutos — evita duplicados tras reinicios
-const logger   = pino({ level: 'warn' }); // silencioso en produccion
+const msgCache = new NodeCache({ stdTTL: 300 });
+const logger   = pino({ level: 'warn' });
 
-// ── Express ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Middleware de autenticacion
-const auth = (req, res, next) => {
+const authMiddleware = (req, res, next) => {
   const token = req.headers['x-server-secret'] || req.query.secret;
   if (token !== SERVER_SECRET) return res.status(401).json({ error: 'No autorizado' });
   next();
 };
 
-// ── Baileys dinamico (importado en runtime) ───────────────────────────────
 async function getBaileys() {
-  const mod = await import('@whiskeysockets/baileys');
-  return mod;
+  return import('@whiskeysockets/baileys');
 }
 
-// ── Crear/reconectar sesion para una empresa ──────────────────────────────
+// Guardar/cargar/borrar creds en Firestore
+async function saveCredsToFirestore(empresaId, creds) {
+  try {
+    await db.collection('wa_sessions').doc(empresaId).set(
+      { creds: JSON.stringify(creds), updatedAt: FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+  } catch (e) { console.error(`[${empresaId}] saveCredsToFirestore:`, e.message); }
+}
+
+async function loadCredsFromFirestore(empresaId) {
+  try {
+    const snap = await db.collection('wa_sessions').doc(empresaId).get();
+    if (!snap.exists) return null;
+    const raw = snap.data().creds;
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+async function deleteSessionFromFirestore(empresaId) {
+  try { await db.collection('wa_sessions').doc(empresaId).delete(); } catch {}
+}
+
+// Iniciar sesion con persistencia en Firestore
 async function iniciarSesion(empresaId) {
-  // Si ya hay sesion activa, no hacer nada
   const existente = sesiones.get(empresaId);
-  if (existente && existente.status === 'connected') {
-    return { status: 'already_connected' };
-  }
+  if (existente && existente.status === 'connected') return { status: 'already_connected' };
 
   const {
     default: makeWASocket,
@@ -67,356 +79,217 @@ async function iniciarSesion(empresaId) {
     fetchLatestBaileysVersion,
   } = await getBaileys();
 
-  // Carpeta de sesion persistente por empresa
-  const sessionDir = path.join(__dirname, 'sessions', empresaId);
+  // Carpeta temporal en /tmp (sobrevive entre deploys en Railway)
+  const sessionDir = path.join('/tmp', 'wa_sessions', empresaId);
   fs.mkdirSync(sessionDir, { recursive: true });
+
+  // Restaurar creds desde Firestore
+  const savedCreds = await loadCredsFromFirestore(empresaId);
+  if (savedCreds) {
+    try {
+      fs.writeFileSync(path.join(sessionDir, 'creds.json'), JSON.stringify(savedCreds));
+      console.log(`[${empresaId}] Creds restauradas desde Firestore`);
+    } catch {}
+  }
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
   const { version }          = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
-    version,
-    logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
+    version, logger,
+    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
   });
 
-  const sesionData = {
-    sock,
-    status: 'connecting',
-    qr: null,
-    qrBase64: null,
-    empresaId,
-    numero: null,
-  };
+  const sesionData = { sock, status: 'connecting', qr: null, qrBase64: null, empresaId, numero: null, connectedAt: null };
   sesiones.set(empresaId, sesionData);
 
-  // ── Eventos Baileys ───────────────────────────────────────────────────
-  sock.ev.on('creds.update', saveCreds);
+  // Guardar creds en Firestore cada vez que cambien
+  sock.ev.on('creds.update', async () => {
+    await saveCreds();
+    try {
+      const credsFile = path.join(sessionDir, 'creds.json');
+      if (fs.existsSync(credsFile)) {
+        const credsData = JSON.parse(fs.readFileSync(credsFile, 'utf8'));
+        await saveCredsToFirestore(empresaId, credsData);
+      }
+    } catch {}
+  });
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      // Generar QR como imagen base64
       const qrBase64 = await qrcode.toDataURL(qr);
-      sesionData.qr      = qr;
-      sesionData.qrBase64 = qrBase64;
-      sesionData.status  = 'qr_ready';
-
-      // Guardar QR en Firestore para que el dashboard lo muestre
-      await db.collection('empresas').doc(empresaId).update({
-        'whatsapp.status': 'qr_ready',
-        'whatsapp.qrBase64': qrBase64,
-        'whatsapp.updatedAt': FieldValue.serverTimestamp(),
-      }).catch(() => {});
-
-      console.log(`[${empresaId}] QR listo para escanear`);
+      sesionData.qr = qr; sesionData.qrBase64 = qrBase64; sesionData.status = 'qr_ready';
+      await db.collection('empresas').doc(empresaId).set(
+        { whatsapp: { status: 'qr_ready', qrBase64, updatedAt: FieldValue.serverTimestamp() } },
+        { merge: true }
+      ).catch(() => {});
+      console.log(`[${empresaId}] QR listo`);
     }
 
     if (connection === 'open') {
-      sesionData.status   = 'connected';
-      sesionData.qr       = null;
-      sesionData.qrBase64 = null;
-      const numero = sock.user?.id?.split(':')[0] || '';
-      sesionData.numero   = numero;
-      // Marcar timestamp de conexion para ignorar mensajes anteriores
+      sesionData.status = 'connected'; sesionData.qr = null; sesionData.qrBase64 = null;
       sesionData.connectedAt = Date.now();
-
-      // Actualizar Firestore: conectado
-      await db.collection('empresas').doc(empresaId).update({
-        'whatsapp.status':    'connected',
-        'whatsapp.numero':    numero,
-        'whatsapp.qrBase64':  null,
-        'whatsapp.connectedAt': FieldValue.serverTimestamp(),
-      }).catch(() => {});
-
-      console.log(`[${empresaId}] WhatsApp conectado - numero: ${numero}`);
+      const numero = sock.user?.id?.split(':')[0] || '';
+      sesionData.numero = numero;
+      await db.collection('empresas').doc(empresaId).set(
+        { whatsapp: { status: 'connected', numero, qrBase64: null, connectedAt: FieldValue.serverTimestamp() } },
+        { merge: true }
+      ).catch(() => {});
+      console.log(`[${empresaId}] Conectado - ${numero}`);
     }
 
     if (connection === 'close') {
-      const code    = lastDisconnect?.error?.output?.statusCode;
-      const logout  = code === DisconnectReason.loggedOut;
+      const code   = lastDisconnect?.error?.output?.statusCode;
+      const logout = code === DisconnectReason.loggedOut;
       sesionData.status = logout ? 'disconnected' : 'reconnecting';
-
       if (logout) {
-        // Limpiar sesion si se cerro sesion
-        fs.rmSync(path.join(__dirname, 'sessions', empresaId), { recursive: true, force: true });
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        await deleteSessionFromFirestore(empresaId);
         sesiones.delete(empresaId);
-        await db.collection('empresas').doc(empresaId).update({
-          'whatsapp.status': 'disconnected',
-          'whatsapp.numero': null,
-        }).catch(() => {});
-        console.log(`[${empresaId}] Sesion cerrada (logout)`);
+        await db.collection('empresas').doc(empresaId).set(
+          { whatsapp: { status: 'disconnected', numero: null } }, { merge: true }
+        ).catch(() => {});
+        console.log(`[${empresaId}] Logout`);
       } else {
-        // Reconectar automaticamente
-        console.log(`[${empresaId}] Desconectado, reconectando...`);
+        console.log(`[${empresaId}] Desconectado (${code}), reconectando en 5s...`);
         setTimeout(() => iniciarSesion(empresaId), 5000);
       }
     }
   });
 
-  // ── Recibir mensajes ──────────────────────────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
-
     for (const msg of messages) {
-      // ❌ Ignorar mensajes propios (enviados por el bot)
-      if (msg.key.fromMe) continue;
-      if (!msg.message)   continue;
-
-      // ❌ Ignorar mensajes de sistema, grupos y broadcasts
+      if (msg.key.fromMe || !msg.message) continue;
       const from = msg.key.remoteJid;
-      if (!from) continue;
-      if (from.endsWith('@g.us'))           continue; // grupos
-      if (from === 'status@broadcast')      continue; // estados
-      if (from.endsWith('@broadcast'))      continue; // broadcasts
-
-      // ❌ Ignorar mensajes muy antiguos (mas de 60 segundos absolutos)
+      if (!from || from.endsWith('@g.us') || from.includes('broadcast')) continue;
       const msgTimestamp = msg.messageTimestamp;
-      if (msgTimestamp && Date.now() / 1000 - msgTimestamp > 60) {
-        console.log(`[${empresaId}] Mensaje antiguo ignorado`);
-        continue;
-      }
-
-      // ❌ Ignorar mensajes anteriores a la conexion de esta sesion
-      if (sesionData.connectedAt && msgTimestamp * 1000 < sesionData.connectedAt) {
-        console.log(`[${empresaId}] Mensaje previo a la conexion ignorado`);
-        continue;
-      }
-
-      // ❌ Evitar procesar el mismo mensaje dos veces
+      if (msgTimestamp && Date.now() / 1000 - msgTimestamp > 60) continue;
+      if (sesionData.connectedAt && msgTimestamp * 1000 < sesionData.connectedAt) continue;
       const msgId = msg.key.id;
-      if (!msgId) continue;
-      if (msgCache.get(msgId)) {
-        console.log(`[${empresaId}] Mensaje duplicado ignorado: ${msgId}`);
-        continue;
-      }
+      if (!msgId || msgCache.get(msgId)) continue;
       msgCache.set(msgId, true);
-
-      // Extraer texto
-      const texto =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.buttonsResponseMessage?.selectedButtonId ||
-        msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
-        msg.message?.imageMessage?.caption ||
-        '';
-
-      if (!texto || texto.trim().length === 0) continue;
-
+      const texto = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+      if (!texto.trim()) continue;
       const numeroCliente = from.replace('@s.whatsapp.net', '');
-      console.log(`[${empresaId}] Mensaje de ${numeroCliente}: ${texto.substring(0, 60)}`);
-
-      // Enviar a la API de agencIAme
+      console.log(`[${empresaId}] Msg de ${numeroCliente}: ${texto.substring(0, 60)}`);
       try {
         const resp = await axios.post(
           `${AGENCIAME_API}/api/whatsapp-baileys`,
           { empresaId, numeroCliente, texto, msgId },
           { headers: { 'x-server-secret': SERVER_SECRET }, timeout: 25000 }
         );
-
         const respuesta = resp.data?.respuesta;
-        if (respuesta && respuesta.trim().length > 0) {
-          await sock.sendMessage(from, { text: respuesta });
-          console.log(`[${empresaId}] Respuesta enviada a ${numeroCliente}`);
-        }
-      } catch (err) {
-        console.error(`[${empresaId}] Error:`, err.message);
-        // Solo enviar fallback si NO es un error de la IA (para no spamear)
-        if (err.code !== 'ECONNABORTED' && err.response?.status !== 500) {
-          await sock.sendMessage(from, {
-            text: 'En este momento no puedo procesar tu mensaje. Por favor intenta en unos minutos.',
-          });
-        }
-      }
+        if (respuesta?.trim()) await sock.sendMessage(from, { text: respuesta });
+      } catch (err) { console.error(`[${empresaId}] Error:`, err.message); }
     }
   });
 
   return { status: 'starting' };
 }
 
-// ── Restaurar sesiones activas al iniciar el servidor ────────────────────
+// Restaurar sesiones desde Firestore al arrancar
 async function restaurarSesiones() {
-  const sessionDir = path.join(__dirname, 'sessions');
-  if (!fs.existsSync(sessionDir)) return;
-
-  const empresas = fs.readdirSync(sessionDir);
-  console.log(`Restaurando ${empresas.length} sesiones...`);
-
-  for (const empresaId of empresas) {
-    try {
-      await iniciarSesion(empresaId);
-      await new Promise(r => setTimeout(r, 1000)); // esperar 1s entre conexiones
-    } catch (err) {
-      console.error(`Error restaurando sesion ${empresaId}:`, err.message);
+  try {
+    const snap = await db.collection('wa_sessions').get();
+    console.log(`Restaurando ${snap.size} sesiones desde Firestore...`);
+    for (const docSnap of snap.docs) {
+      try {
+        await iniciarSesion(docSnap.id);
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (e) { console.error(`Error restaurando ${docSnap.id}:`, e.message); }
     }
-  }
+  } catch (e) { console.error('restaurarSesiones:', e.message); }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// RUTAS API
-// ═══════════════════════════════════════════════════════════════════════
-
-// GET /health — estado del servidor
+// Rutas
 app.get('/health', (req, res) => {
   const activas = [...sesiones.values()].filter(s => s.status === 'connected').length;
-  res.json({
-    ok: true,
-    sesionesActivas: activas,
-    sesionesTotales: sesiones.size,
-    uptime: process.uptime(),
-  });
+  res.json({ ok: true, sesionesActivas: activas, sesionesTotales: sesiones.size, uptime: process.uptime() });
 });
 
-// POST /sesion/iniciar — iniciar sesion para una empresa (genera QR)
-app.post('/sesion/iniciar', auth, async (req, res) => {
+app.post('/sesion/iniciar', authMiddleware, async (req, res) => {
   const { empresaId } = req.body;
   if (!empresaId) return res.status(400).json({ error: 'empresaId requerido' });
-
-  try {
-    const result = await iniciarSesion(empresaId);
-    res.json({ ok: true, ...result });
-  } catch (err) {
-    console.error('Error iniciando sesion:', err);
-    res.status(500).json({ error: err.message });
-  }
+  try { res.json({ ok: true, ...await iniciarSesion(empresaId) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /sesion/:empresaId/qr — obtener QR actual como imagen base64
-app.get('/sesion/:empresaId/qr', auth, async (req, res) => {
+app.get('/sesion/:empresaId/qr', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
-
-  if (!sesion) {
-    return res.status(404).json({ error: 'Sesion no encontrada. Inicia la sesion primero.' });
-  }
-
-  if (sesion.status === 'connected') {
-    return res.json({ status: 'connected', numero: sesion.numero });
-  }
-
-  if (sesion.status === 'qr_ready' && sesion.qrBase64) {
-    return res.json({ status: 'qr_ready', qrBase64: sesion.qrBase64 });
-  }
-
-  // Esperar hasta 15s a que aparezca el QR
-  let intentos = 0;
-  const esperar = () => new Promise(resolve => setTimeout(resolve, 1000));
-
-  while (intentos < 15) {
-    await esperar();
+  if (!sesion) return res.status(404).json({ error: 'Sesion no encontrada' });
+  if (sesion.status === 'connected') return res.json({ status: 'connected', numero: sesion.numero });
+  if (sesion.qrBase64) return res.json({ status: 'qr_ready', qrBase64: sesion.qrBase64 });
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 1000));
     const s = sesiones.get(empresaId);
-    if (s?.qrBase64)          return res.json({ status: 'qr_ready', qrBase64: s.qrBase64 });
+    if (s?.qrBase64) return res.json({ status: 'qr_ready', qrBase64: s.qrBase64 });
     if (s?.status === 'connected') return res.json({ status: 'connected', numero: s.numero });
-    intentos++;
   }
-
-  res.status(408).json({ error: 'Tiempo de espera agotado. Reintenta.' });
+  res.status(408).json({ error: 'Timeout esperando QR' });
 });
 
-// GET /sesion/:empresaId/status — estado de la sesion
-app.get('/sesion/:empresaId/status', auth, async (req, res) => {
-  const { empresaId } = req.params;
-  const sesion = sesiones.get(empresaId);
-
-  if (!sesion) return res.json({ status: 'not_started', empresaId });
-
-  res.json({
-    status:  sesion.status,
-    numero:  sesion.numero,
-    empresaId,
-  });
+app.get('/sesion/:empresaId/status', authMiddleware, (req, res) => {
+  const s = sesiones.get(req.params.empresaId);
+  res.json(s ? { status: s.status, numero: s.numero } : { status: 'not_started' });
 });
 
-// POST /sesion/:empresaId/desconectar — desconectar empresa
-app.post('/sesion/:empresaId/desconectar', auth, async (req, res) => {
+app.post('/sesion/:empresaId/desconectar', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
-
-  if (sesion?.sock) {
-    try {
-      await sesion.sock.logout();
-    } catch {}
-  }
-
-  fs.rmSync(path.join(__dirname, 'sessions', empresaId), { recursive: true, force: true });
+  if (sesion?.sock) try { await sesion.sock.logout(); } catch {}
+  fs.rmSync(path.join('/tmp', 'wa_sessions', empresaId), { recursive: true, force: true });
+  await deleteSessionFromFirestore(empresaId);
   sesiones.delete(empresaId);
-
-  await db.collection('empresas').doc(empresaId).update({
-    'whatsapp.status': 'disconnected',
-    'whatsapp.numero': null,
-  }).catch(() => {});
-
-  res.json({ ok: true, mensaje: 'Sesion desconectada' });
+  await db.collection('empresas').doc(empresaId).set(
+    { whatsapp: { status: 'disconnected', numero: null } }, { merge: true }
+  ).catch(() => {});
+  res.json({ ok: true });
 });
 
-// POST /enviar — enviar mensaje desde la plataforma (para notificaciones)
-app.post('/enviar', auth, async (req, res) => {
-  const { empresaId, numero, texto } = req.body;
-  if (!empresaId || !numero || !texto) {
-    return res.status(400).json({ error: 'empresaId, numero y texto requeridos' });
-  }
+app.get('/sesiones', authMiddleware, async (req, res) => {
+  const enMemoria = [...sesiones.entries()].map(([id, s]) => ({ empresaId: id, status: s.status, numero: s.numero }));
+  const snap = await db.collection('wa_sessions').get();
+  res.json({ enMemoria, enFirestore: snap.docs.map(d => d.id) });
+});
 
+app.delete('/sesion/:empresaId', authMiddleware, async (req, res) => {
+  const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
-  if (!sesion || sesion.status !== 'connected') {
-    return res.status(400).json({ error: 'Empresa no conectada a WhatsApp' });
-  }
+  if (sesion?.sock) try { await sesion.sock.logout(); } catch {}
+  fs.rmSync(path.join('/tmp', 'wa_sessions', empresaId), { recursive: true, force: true });
+  await deleteSessionFromFirestore(empresaId);
+  sesiones.delete(empresaId);
+  res.json({ ok: true });
+});
 
+app.delete('/sesiones/todas', authMiddleware, async (req, res) => {
+  const snap = await db.collection('wa_sessions').get();
+  for (const d of snap.docs) {
+    const s = sesiones.get(d.id);
+    if (s?.sock) try { await s.sock.logout(); } catch {}
+    sesiones.delete(d.id);
+    await d.ref.delete();
+  }
+  fs.rmSync(path.join('/tmp', 'wa_sessions'), { recursive: true, force: true });
+  res.json({ ok: true });
+});
+
+app.post('/enviar', authMiddleware, async (req, res) => {
+  const { empresaId, numero, texto } = req.body;
+  const sesion = sesiones.get(empresaId);
+  if (!sesion || sesion.status !== 'connected') return res.status(400).json({ error: 'No conectado' });
   try {
     const jid = numero.includes('@') ? numero : `${numero}@s.whatsapp.net`;
     await sesion.sock.sendMessage(jid, { text: texto });
     res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /sesiones — listar todas las sesiones activas (para debug)
-app.get('/sesiones', auth, (req, res) => {
-  const lista = [...sesiones.entries()].map(([id, s]) => ({
-    empresaId: id,
-    status:    s.status,
-    numero:    s.numero,
-  }));
-  // Tambien listar carpetas en disco
-  const sessionDir = path.join(__dirname, 'sessions');
-  const enDisco = fs.existsSync(sessionDir) ? fs.readdirSync(sessionDir) : [];
-  res.json({ enMemoria: lista, enDisco });
-});
-
-// DELETE /sesion/:empresaId — eliminar sesion completamente (numero incluido)
-app.delete('/sesion/:empresaId', auth, async (req, res) => {
-  const { empresaId } = req.params;
-  const sesion = sesiones.get(empresaId);
-  if (sesion?.sock) {
-    try { await sesion.sock.logout(); } catch {}
-  }
-  fs.rmSync(path.join(__dirname, 'sessions', empresaId), { recursive: true, force: true });
-  sesiones.delete(empresaId);
-  await db.collection('empresas').doc(empresaId).update({
-    'whatsapp.status': 'disconnected',
-    'whatsapp.numero': null,
-  }).catch(() => {});
-  res.json({ ok: true, eliminado: empresaId });
-});
-
-// DELETE /sesiones/todas — eliminar TODAS las sesiones (reset total)
-app.delete('/sesiones/todas', auth, async (req, res) => {
-  const sessionDir = path.join(__dirname, 'sessions');
-  const ids = fs.existsSync(sessionDir) ? fs.readdirSync(sessionDir) : [];
-  for (const id of ids) {
-    const sesion = sesiones.get(id);
-    if (sesion?.sock) { try { await sesion.sock.logout(); } catch {} }
-    fs.rmSync(path.join(sessionDir, id), { recursive: true, force: true });
-    sesiones.delete(id);
-  }
-  res.json({ ok: true, eliminadas: ids });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, async () => {
-  console.log(`agencIAme WhatsApp Server corriendo en puerto ${PORT}`);
+  console.log(`agencIAme WhatsApp Server en puerto ${PORT}`);
   await restaurarSesiones();
 });
