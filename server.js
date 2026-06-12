@@ -23,7 +23,7 @@ const db = getFirestore();
 
 const PORT          = process.env.PORT || 3001;
 const SERVER_SECRET = process.env.SERVER_SECRET || 'agenciame2026secreto_nexoia';
-const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://nexoia-soporteias-projects.vercel.app';
+const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://agenciame.com';
 
 const sesiones = new Map();
 const msgCache = new NodeCache({ stdTTL: 300 });
@@ -79,11 +79,9 @@ async function iniciarSesion(empresaId) {
     fetchLatestBaileysVersion,
   } = await getBaileys();
 
-  // Carpeta temporal en /tmp (sobrevive entre deploys en Railway)
   const sessionDir = path.join('/tmp', 'wa_sessions', empresaId);
   fs.mkdirSync(sessionDir, { recursive: true });
 
-  // Restaurar creds desde Firestore
   const savedCreds = await loadCredsFromFirestore(empresaId);
   if (savedCreds) {
     try {
@@ -105,7 +103,6 @@ async function iniciarSesion(empresaId) {
   const sesionData = { sock, status: 'connecting', qr: null, qrBase64: null, empresaId, numero: null, connectedAt: null };
   sesiones.set(empresaId, sesionData);
 
-  // Guardar creds en Firestore cada vez que cambien
   sock.ev.on('creds.update', async () => {
     await saveCreds();
     try {
@@ -134,10 +131,19 @@ async function iniciarSesion(empresaId) {
       const numero = sock.user?.id?.split(':')[0] || '';
       sesionData.numero = numero;
       await db.collection('empresas').doc(empresaId).set(
-        { whatsapp: { status: 'connected', numero, qrBase64: null, connectedAt: FieldValue.serverTimestamp() } },
+        {
+          whatsapp: {
+            status: 'connected',
+            activo: true,
+            numero,
+            qrBase64: null,
+            connectedAt: FieldValue.serverTimestamp(),
+          }
+        },
         { merge: true }
       ).catch(() => {});
       console.log(`[${empresaId}] Conectado - ${numero}`);
+      console.log(`[${empresaId}] AGENCIAME_API apunta a: ${AGENCIAME_API}`);
     }
 
     if (connection === 'close') {
@@ -149,7 +155,7 @@ async function iniciarSesion(empresaId) {
         await deleteSessionFromFirestore(empresaId);
         sesiones.delete(empresaId);
         await db.collection('empresas').doc(empresaId).set(
-          { whatsapp: { status: 'disconnected', numero: null } }, { merge: true }
+          { whatsapp: { status: 'disconnected', activo: false, numero: null } }, { merge: true }
         ).catch(() => {});
         console.log(`[${empresaId}] Logout`);
       } else {
@@ -171,10 +177,14 @@ async function iniciarSesion(empresaId) {
       const msgId = msg.key.id;
       if (!msgId || msgCache.get(msgId)) continue;
       msgCache.set(msgId, true);
-      const texto = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+      const texto =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.imageMessage?.caption || '';
       if (!texto.trim()) continue;
       const numeroCliente = from.replace('@s.whatsapp.net', '');
-      console.log(`[${empresaId}] Msg de ${numeroCliente}: ${texto.substring(0, 60)}`);
+      console.log(`[${empresaId}] MSG de ${numeroCliente}: ${texto.substring(0, 80)}`);
+
       try {
         const resp = await axios.post(
           `${AGENCIAME_API}/api/whatsapp-baileys`,
@@ -182,8 +192,18 @@ async function iniciarSesion(empresaId) {
           { headers: { 'x-server-secret': SERVER_SECRET }, timeout: 25000 }
         );
         const respuesta = resp.data?.respuesta;
-        if (respuesta?.trim()) await sock.sendMessage(from, { text: respuesta });
-      } catch (err) { console.error(`[${empresaId}] Error:`, err.message); }
+        console.log(`[${empresaId}] Respuesta IA: ${respuesta ? respuesta.substring(0,80) : 'null'}`);
+        if (respuesta?.trim()) {
+          await sock.sendMessage(from, { text: respuesta });
+        }
+      } catch (err) {
+        if (err.response) {
+          console.error(`[${empresaId}] Error API ${err.response.status}: ${JSON.stringify(err.response.data)}`);
+          console.error(`[${empresaId}] URL llamada: ${AGENCIAME_API}/api/whatsapp-baileys`);
+        } else {
+          console.error(`[${empresaId}] Error red: ${err.message}`);
+        }
+      }
     }
   });
 
@@ -204,10 +224,18 @@ async function restaurarSesiones() {
   } catch (e) { console.error('restaurarSesiones:', e.message); }
 }
 
-// Rutas
+// ── RUTAS ─────────────────────────────────────────────────────
+
 app.get('/health', (req, res) => {
   const activas = [...sesiones.values()].filter(s => s.status === 'connected').length;
-  res.json({ ok: true, sesionesActivas: activas, sesionesTotales: sesiones.size, uptime: process.uptime() });
+  res.json({
+    ok: true,
+    sesionesActivas: activas,
+    sesionesTotales: sesiones.size,
+    uptime: process.uptime(),
+    apiUrl: AGENCIAME_API,
+    secretOk: !!SERVER_SECRET,
+  });
 });
 
 app.post('/sesion/iniciar', authMiddleware, async (req, res) => {
@@ -237,6 +265,47 @@ app.get('/sesion/:empresaId/status', authMiddleware, (req, res) => {
   res.json(s ? { status: s.status, numero: s.numero } : { status: 'not_started' });
 });
 
+// ── PAIRING CODE: conectar sin QR (para usuarios en un solo celular) ────────
+// Requiere que la sesion ya haya sido iniciada con /sesion/iniciar
+// Baileys expone requestPairingCode(phoneNumber) que le pide a WhatsApp
+// enviar un codigo de 8 digitos al numero especificado
+app.post('/sesion/:empresaId/pairing-code', authMiddleware, async (req, res) => {
+  const { empresaId } = req.params;
+  const { telefono }  = req.body; // numero sin + ej: 573001234567
+
+  if (!telefono) return res.status(400).json({ error: 'telefono requerido' });
+
+  const sesion = sesiones.get(empresaId);
+  if (!sesion || !sesion.sock) {
+    return res.status(400).json({ error: 'Sesion no iniciada. Llama primero a /sesion/iniciar' });
+  }
+  if (sesion.status === 'connected') {
+    return res.json({ ok: true, status: 'already_connected', numero: sesion.numero });
+  }
+
+  try {
+    // Esperar hasta que el socket este listo (creds.registered = false = listo para pairing)
+    let intentos = 0;
+    while (sesion.sock.authState?.creds?.registered !== false && intentos < 15) {
+      await new Promise(r => setTimeout(r, 1000));
+      intentos++;
+    }
+
+    const code = await sesion.sock.requestPairingCode(telefono.trim());
+    console.log(`[${empresaId}] Pairing code generado para ${telefono}: ${code}`);
+
+    // Formatear con guion: XXXX-XXXX
+    const formatted = code ? String(code).replace(/(.{4})(.{4})/, '$1-$2') : code;
+
+    return res.json({ ok: true, code: formatted, raw: code });
+  } catch (e) {
+    console.error(`[${empresaId}] Error pairing code:`, e.message);
+    return res.status(500).json({
+      error: 'No se pudo generar el codigo. ' + e.message,
+    });
+  }
+});
+
 app.post('/sesion/:empresaId/desconectar', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
@@ -245,7 +314,7 @@ app.post('/sesion/:empresaId/desconectar', authMiddleware, async (req, res) => {
   await deleteSessionFromFirestore(empresaId);
   sesiones.delete(empresaId);
   await db.collection('empresas').doc(empresaId).set(
-    { whatsapp: { status: 'disconnected', numero: null } }, { merge: true }
+    { whatsapp: { status: 'disconnected', activo: false, numero: null } }, { merge: true }
   ).catch(() => {});
   res.json({ ok: true });
 });
@@ -290,6 +359,8 @@ app.post('/enviar', authMiddleware, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`agencIAme WhatsApp Server en puerto ${PORT}`);
+  console.log(`\nagencIAme WhatsApp Server en puerto ${PORT}`);
+  console.log(`API Vercel: ${AGENCIAME_API}`);
+  console.log(`Secret configurado: ${SERVER_SECRET ? 'SI (' + SERVER_SECRET.substring(0,8) + '...)' : 'NO'}`);
   await restaurarSesiones();
 });
