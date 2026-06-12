@@ -1,5 +1,5 @@
 // server.js — agencIAme WhatsApp Multi-Empresa Server
-// Persistencia de sesiones en Firestore (sin volumen en Railway)
+// v2: soporte QR + Pairing Code (sin segundo dispositivo)
 
 import express from 'express';
 import cors from 'cors';
@@ -43,7 +43,6 @@ async function getBaileys() {
   return import('@whiskeysockets/baileys');
 }
 
-// Guardar/cargar/borrar creds en Firestore
 async function saveCredsToFirestore(empresaId, creds) {
   try {
     await db.collection('wa_sessions').doc(empresaId).set(
@@ -66,11 +65,7 @@ async function deleteSessionFromFirestore(empresaId) {
   try { await db.collection('wa_sessions').doc(empresaId).delete(); } catch {}
 }
 
-// Iniciar sesion con persistencia en Firestore
-async function iniciarSesion(empresaId) {
-  const existente = sesiones.get(empresaId);
-  if (existente && existente.status === 'connected') return { status: 'already_connected' };
-
+async function crearSocket(empresaId, usePairingCode = false) {
   const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -98,9 +93,11 @@ async function iniciarSesion(empresaId) {
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
+    printQRInTerminal: !usePairingCode,
+    ...(usePairingCode ? { browser: ['agencIAme', 'Chrome', '120.0.0'] } : {}),
   });
 
-  const sesionData = { sock, status: 'connecting', qr: null, qrBase64: null, empresaId, numero: null, connectedAt: null };
+  const sesionData = { sock, status: 'connecting', qr: null, qrBase64: null, empresaId, numero: null, connectedAt: null, usePairingCode };
   sesiones.set(empresaId, sesionData);
 
   sock.ev.on('creds.update', async () => {
@@ -115,7 +112,7 @@ async function iniciarSesion(empresaId) {
   });
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
+    if (qr && !usePairingCode) {
       const qrBase64 = await qrcode.toDataURL(qr);
       sesionData.qr = qr; sesionData.qrBase64 = qrBase64; sesionData.status = 'qr_ready';
       await db.collection('empresas').doc(empresaId).set(
@@ -126,24 +123,16 @@ async function iniciarSesion(empresaId) {
     }
 
     if (connection === 'open') {
-      sesionData.status = 'connected'; sesionData.qr = null; sesionData.qrBase64 = null;
+      sesionData.status = 'connected';
+      sesionData.qr = null; sesionData.qrBase64 = null;
       sesionData.connectedAt = Date.now();
       const numero = sock.user?.id?.split(':')[0] || '';
       sesionData.numero = numero;
       await db.collection('empresas').doc(empresaId).set(
-        {
-          whatsapp: {
-            status: 'connected',
-            activo: true,
-            numero,
-            qrBase64: null,
-            connectedAt: FieldValue.serverTimestamp(),
-          }
-        },
+        { whatsapp: { status: 'connected', activo: true, numero, qrBase64: null, connectedAt: FieldValue.serverTimestamp() } },
         { merge: true }
       ).catch(() => {});
       console.log(`[${empresaId}] Conectado - ${numero}`);
-      console.log(`[${empresaId}] AGENCIAME_API apunta a: ${AGENCIAME_API}`);
     }
 
     if (connection === 'close') {
@@ -160,7 +149,7 @@ async function iniciarSesion(empresaId) {
         console.log(`[${empresaId}] Logout`);
       } else {
         console.log(`[${empresaId}] Desconectado (${code}), reconectando en 5s...`);
-        setTimeout(() => iniciarSesion(empresaId), 5000);
+        setTimeout(() => crearSocket(empresaId, false), 5000);
       }
     }
   });
@@ -184,7 +173,6 @@ async function iniciarSesion(empresaId) {
       if (!texto.trim()) continue;
       const numeroCliente = from.replace('@s.whatsapp.net', '');
       console.log(`[${empresaId}] MSG de ${numeroCliente}: ${texto.substring(0, 80)}`);
-
       try {
         const resp = await axios.post(
           `${AGENCIAME_API}/api/whatsapp-baileys`,
@@ -192,25 +180,24 @@ async function iniciarSesion(empresaId) {
           { headers: { 'x-server-secret': SERVER_SECRET }, timeout: 25000 }
         );
         const respuesta = resp.data?.respuesta;
-        console.log(`[${empresaId}] Respuesta IA: ${respuesta ? respuesta.substring(0,80) : 'null'}`);
-        if (respuesta?.trim()) {
-          await sock.sendMessage(from, { text: respuesta });
-        }
+        if (respuesta?.trim()) await sock.sendMessage(from, { text: respuesta });
       } catch (err) {
-        if (err.response) {
-          console.error(`[${empresaId}] Error API ${err.response.status}: ${JSON.stringify(err.response.data)}`);
-          console.error(`[${empresaId}] URL llamada: ${AGENCIAME_API}/api/whatsapp-baileys`);
-        } else {
-          console.error(`[${empresaId}] Error red: ${err.message}`);
-        }
+        if (err.response) console.error(`[${empresaId}] Error API ${err.response.status}:`, JSON.stringify(err.response.data));
+        else console.error(`[${empresaId}] Error red: ${err.message}`);
       }
     }
   });
 
+  return sesionData;
+}
+
+async function iniciarSesion(empresaId) {
+  const existente = sesiones.get(empresaId);
+  if (existente && existente.status === 'connected') return { status: 'already_connected' };
+  await crearSocket(empresaId, false);
   return { status: 'starting' };
 }
 
-// Restaurar sesiones desde Firestore al arrancar
 async function restaurarSesiones() {
   try {
     const snap = await db.collection('wa_sessions').get();
@@ -224,18 +211,13 @@ async function restaurarSesiones() {
   } catch (e) { console.error('restaurarSesiones:', e.message); }
 }
 
-// ── RUTAS ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+//  RUTAS
+// ══════════════════════════════════════════════════════════════
 
 app.get('/health', (req, res) => {
   const activas = [...sesiones.values()].filter(s => s.status === 'connected').length;
-  res.json({
-    ok: true,
-    sesionesActivas: activas,
-    sesionesTotales: sesiones.size,
-    uptime: process.uptime(),
-    apiUrl: AGENCIAME_API,
-    secretOk: !!SERVER_SECRET,
-  });
+  res.json({ ok: true, sesionesActivas: activas, sesionesTotales: sesiones.size, uptime: process.uptime(), apiUrl: AGENCIAME_API });
 });
 
 app.post('/sesion/iniciar', authMiddleware, async (req, res) => {
@@ -265,44 +247,50 @@ app.get('/sesion/:empresaId/status', authMiddleware, (req, res) => {
   res.json(s ? { status: s.status, numero: s.numero } : { status: 'not_started' });
 });
 
-// ── PAIRING CODE: conectar sin QR (para usuarios en un solo celular) ────────
-// Requiere que la sesion ya haya sido iniciada con /sesion/iniciar
-// Baileys expone requestPairingCode(phoneNumber) que le pide a WhatsApp
-// enviar un codigo de 8 digitos al numero especificado
+// ── PAIRING CODE paso 1: iniciar socket en modo pairing ───────
+app.post('/sesion/:empresaId/iniciar-pairing', authMiddleware, async (req, res) => {
+  const { empresaId } = req.params;
+  try {
+    const existente = sesiones.get(empresaId);
+    if (existente?.sock) try { existente.sock.end(); } catch {}
+    sesiones.delete(empresaId);
+    await crearSocket(empresaId, true);
+    await new Promise(r => setTimeout(r, 3000));
+    res.json({ ok: true, status: 'ready_for_pairing' });
+  } catch (e) {
+    console.error(`[${empresaId}] iniciar-pairing error:`, e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PAIRING CODE paso 2: solicitar codigo de 8 digitos ────────
 app.post('/sesion/:empresaId/pairing-code', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
-  const { telefono }  = req.body; // numero sin + ej: 573001234567
+  const { telefono }  = req.body;
 
   if (!telefono) return res.status(400).json({ error: 'telefono requerido' });
 
   const sesion = sesiones.get(empresaId);
-  if (!sesion || !sesion.sock) {
-    return res.status(400).json({ error: 'Sesion no iniciada. Llama primero a /sesion/iniciar' });
-  }
-  if (sesion.status === 'connected') {
-    return res.json({ ok: true, status: 'already_connected', numero: sesion.numero });
-  }
+  if (!sesion?.sock) return res.status(400).json({ error: 'Primero llama a /iniciar-pairing' });
+  if (sesion.status === 'connected') return res.json({ ok: true, status: 'already_connected', numero: sesion.numero });
 
   try {
-    // Esperar hasta que el socket este listo (creds.registered = false = listo para pairing)
-    let intentos = 0;
-    while (sesion.sock.authState?.creds?.registered !== false && intentos < 15) {
-      await new Promise(r => setTimeout(r, 1000));
-      intentos++;
-    }
+    const tel = telefono.replace(/\D/g, '');
+    console.log(`[${empresaId}] Solicitando pairing code para ${tel}...`);
 
-    const code = await sesion.sock.requestPairingCode(telefono.trim());
-    console.log(`[${empresaId}] Pairing code generado para ${telefono}: ${code}`);
+    const code = await sesion.sock.requestPairingCode(tel);
 
-    // Formatear con guion: XXXX-XXXX
-    const formatted = code ? String(code).replace(/(.{4})(.{4})/, '$1-$2') : code;
+    // ── FIX: enviar el codigo RAW sin ninguna modificacion ────
+    // Baileys devuelve exactamente 8 chars: "ABCD1234"
+    // El regex anterior /(.{4})(?=.)/ cortaba el ultimo digito
+    // El frontend divide visualmente en bloques para mostrar
+    const rawCode = String(code || '');
+    console.log(`[${empresaId}] Pairing code: "${rawCode}" (${rawCode.length} chars)`);
 
-    return res.json({ ok: true, code: formatted, raw: code });
+    res.json({ ok: true, code: rawCode, raw: rawCode });
   } catch (e) {
-    console.error(`[${empresaId}] Error pairing code:`, e.message);
-    return res.status(500).json({
-      error: 'No se pudo generar el codigo. ' + e.message,
-    });
+    console.error(`[${empresaId}] requestPairingCode error:`, e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -310,7 +298,8 @@ app.post('/sesion/:empresaId/desconectar', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
   if (sesion?.sock) try { await sesion.sock.logout(); } catch {}
-  fs.rmSync(path.join('/tmp', 'wa_sessions', empresaId), { recursive: true, force: true });
+  const sessionDir = path.join('/tmp', 'wa_sessions', empresaId);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
   await deleteSessionFromFirestore(empresaId);
   sesiones.delete(empresaId);
   await db.collection('empresas').doc(empresaId).set(
@@ -329,7 +318,8 @@ app.delete('/sesion/:empresaId', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
   if (sesion?.sock) try { await sesion.sock.logout(); } catch {}
-  fs.rmSync(path.join('/tmp', 'wa_sessions', empresaId), { recursive: true, force: true });
+  const sessionDir = path.join('/tmp', 'wa_sessions', empresaId);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
   await deleteSessionFromFirestore(empresaId);
   sesiones.delete(empresaId);
   res.json({ ok: true });
@@ -359,8 +349,8 @@ app.post('/enviar', authMiddleware, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`\nagencIAme WhatsApp Server en puerto ${PORT}`);
+  console.log(`\nagencIAme WhatsApp Server v2 en puerto ${PORT}`);
   console.log(`API Vercel: ${AGENCIAME_API}`);
-  console.log(`Secret configurado: ${SERVER_SECRET ? 'SI (' + SERVER_SECRET.substring(0,8) + '...)' : 'NO'}`);
+  console.log(`Secret: ${SERVER_SECRET ? 'OK' : 'FALTA'}`);
   await restaurarSesiones();
 });

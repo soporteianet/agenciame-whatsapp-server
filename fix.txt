@@ -1,0 +1,7 @@
+    const code = await sesion.sock.requestPairingCode(tel);
+    const rawCode = String(code || '');
+    console.log(`[${empresaId}] Pairing code raw: "${rawCode}" (${rawCode.length} chars)`);
+
+    // NO modificar el codigo — enviarlo exactamente como llega de Baileys
+    // El frontend lo muestra dividido visualmente pero el usuario escribe los 8 chars
+    res.json({ ok: true, code: rawCode, raw: rawCode });

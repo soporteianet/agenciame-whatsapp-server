@@ -1,0 +1,6 @@
+    const code = await sesion.sock.requestPairingCode(tel);
+    console.log(`[${empresaId}] Pairing code raw: "${code}" (${code?.length} chars)`);
+
+    // Enviar el codigo SIN modificar — el frontend lo formatea para mostrar
+    // Baileys ya devuelve formato correcto tipo "ABCD1234" o "ABCD-1234"
+    res.json({ ok: true, code: String(code), raw: code });
