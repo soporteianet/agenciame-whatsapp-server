@@ -1,5 +1,5 @@
 // server.js — agencIAme WhatsApp Multi-Empresa Server
-// v2: soporte QR + Pairing Code (sin segundo dispositivo)
+// v3: soporte QR + Pairing Code + envio de imagenes
 
 import express from 'express';
 import cors from 'cors';
@@ -63,6 +63,26 @@ async function loadCredsFromFirestore(empresaId) {
 
 async function deleteSessionFromFirestore(empresaId) {
   try { await db.collection('wa_sessions').doc(empresaId).delete(); } catch {}
+}
+
+// ── Enviar imagen por WhatsApp desde URL ──────────────────────
+async function enviarImagen(sock, jid, url, caption = '') {
+  try {
+    // Descargar imagen como buffer
+    const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+    const buffer = Buffer.from(resp.data);
+    const mimetype = resp.headers['content-type'] || 'image/jpeg';
+
+    await sock.sendMessage(jid, {
+      image: buffer,
+      mimetype,
+      caption: caption || undefined,
+    });
+    return true;
+  } catch (e) {
+    console.error(`Error enviando imagen ${url}:`, e.message);
+    return false;
+  }
 }
 
 async function crearSocket(empresaId, usePairingCode = false) {
@@ -173,14 +193,33 @@ async function crearSocket(empresaId, usePairingCode = false) {
       if (!texto.trim()) continue;
       const numeroCliente = from.replace('@s.whatsapp.net', '');
       console.log(`[${empresaId}] MSG de ${numeroCliente}: ${texto.substring(0, 80)}`);
+
       try {
         const resp = await axios.post(
           `${AGENCIAME_API}/api/whatsapp-baileys`,
           { empresaId, numeroCliente, texto, msgId },
           { headers: { 'x-server-secret': SERVER_SECRET }, timeout: 25000 }
         );
+
         const respuesta = resp.data?.respuesta;
-        if (respuesta?.trim()) await sock.sendMessage(from, { text: respuesta });
+        const imagenes  = resp.data?.imagenes || []; // [{url, caption}]
+
+        // 1. Enviar texto primero
+        if (respuesta?.trim()) {
+          await sock.sendMessage(from, { text: respuesta });
+        }
+
+        // 2. Enviar imagenes una por una con pausa entre ellas
+        if (imagenes.length > 0) {
+          console.log(`[${empresaId}] Enviando ${imagenes.length} imagenes a ${numeroCliente}`);
+          for (const img of imagenes) {
+            if (!img?.url) continue;
+            await enviarImagen(sock, from, img.url, img.caption || '');
+            // Pausa de 500ms entre imagenes para no saturar
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+
       } catch (err) {
         if (err.response) console.error(`[${empresaId}] Error API ${err.response.status}:`, JSON.stringify(err.response.data));
         else console.error(`[${empresaId}] Error red: ${err.message}`);
@@ -247,7 +286,6 @@ app.get('/sesion/:empresaId/status', authMiddleware, (req, res) => {
   res.json(s ? { status: s.status, numero: s.numero } : { status: 'not_started' });
 });
 
-// ── PAIRING CODE paso 1: iniciar socket en modo pairing ───────
 app.post('/sesion/:empresaId/iniciar-pairing', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   try {
@@ -263,30 +301,19 @@ app.post('/sesion/:empresaId/iniciar-pairing', authMiddleware, async (req, res) 
   }
 });
 
-// ── PAIRING CODE paso 2: solicitar codigo de 8 digitos ────────
 app.post('/sesion/:empresaId/pairing-code', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   const { telefono }  = req.body;
-
   if (!telefono) return res.status(400).json({ error: 'telefono requerido' });
-
   const sesion = sesiones.get(empresaId);
   if (!sesion?.sock) return res.status(400).json({ error: 'Primero llama a /iniciar-pairing' });
   if (sesion.status === 'connected') return res.json({ ok: true, status: 'already_connected', numero: sesion.numero });
-
   try {
     const tel = telefono.replace(/\D/g, '');
     console.log(`[${empresaId}] Solicitando pairing code para ${tel}...`);
-
     const code = await sesion.sock.requestPairingCode(tel);
-
-    // ── FIX: enviar el codigo RAW sin ninguna modificacion ────
-    // Baileys devuelve exactamente 8 chars: "ABCD1234"
-    // El regex anterior /(.{4})(?=.)/ cortaba el ultimo digito
-    // El frontend divide visualmente en bloques para mostrar
     const rawCode = String(code || '');
     console.log(`[${empresaId}] Pairing code: "${rawCode}" (${rawCode.length} chars)`);
-
     res.json({ ok: true, code: rawCode, raw: rawCode });
   } catch (e) {
     console.error(`[${empresaId}] requestPairingCode error:`, e.message);
@@ -349,7 +376,7 @@ app.post('/enviar', authMiddleware, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`\nagencIAme WhatsApp Server v2 en puerto ${PORT}`);
+  console.log(`\nagencIAme WhatsApp Server v3 en puerto ${PORT}`);
   console.log(`API Vercel: ${AGENCIAME_API}`);
   console.log(`Secret: ${SERVER_SECRET ? 'OK' : 'FALTA'}`);
   await restaurarSesiones();
