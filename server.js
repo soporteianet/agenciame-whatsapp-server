@@ -1,5 +1,6 @@
 // server.js — agencIAme WhatsApp Multi-Empresa Server
-// v3: soporte QR + Pairing Code + envio de imagenes
+// v4: + recordatorios de citas (Plan Pro) + seguimiento post-servicio (Estandar/Pro)
+//     con limites de seguridad: horario, delays aleatorios y tope diario por empresa
 
 import express from 'express';
 import cors from 'cors';
@@ -251,6 +252,199 @@ async function restaurarSesiones() {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  RECORDATORIOS DE CITAS (Plan Pro) + SEGUIMIENTO POST-SERVICIO
+//  (Plan Estandar y Pro) — con limites de seguridad anti-bloqueo
+// ══════════════════════════════════════════════════════════════
+
+const ZONA_COL          = 'America/Bogota';
+const HORA_INICIO       = 8;   // 8am
+const HORA_FIN          = 20;  // 8pm
+const TOPE_DIARIO_AUTO  = 60;  // max mensajes automaticos por empresa por dia
+const DELAY_MIN_MS      = 4000;
+const DELAY_MAX_MS      = 12000;
+
+function horaColombia() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: ZONA_COL }));
+}
+
+function dentroHorarioPermitido() {
+  const h = horaColombia().getHours();
+  return h >= HORA_INICIO && h < HORA_FIN;
+}
+
+function fechaColombiaKey() {
+  const d = horaColombia();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+// Devuelve true si la empresa todavia tiene cupo hoy, e incrementa el contador
+async function puedeEnviarHoy(empresaId, max = TOPE_DIARIO_AUTO) {
+  try {
+    const fecha = fechaColombiaKey();
+    const ref   = db.collection('empresas').doc(empresaId).collection('contadores').doc(fecha);
+    const snap  = await ref.get();
+    const actual = snap.exists ? (snap.data().enviosAutomaticos || 0) : 0;
+    if (actual >= max) return false;
+    await ref.set({ enviosAutomaticos: FieldValue.increment(1), fecha, actualizadoEn: FieldValue.serverTimestamp() }, { merge: true });
+    return true;
+  } catch (e) {
+    console.error(`[${empresaId}] puedeEnviarHoy:`, e.message);
+    return false; // ante la duda, no enviar
+  }
+}
+
+function delayAleatorio(min = DELAY_MIN_MS, max = DELAY_MAX_MS) {
+  return new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
+}
+
+function toDateFlexible(v) {
+  if (!v) return null;
+  if (typeof v.toDate === 'function') return v.toDate();
+  if (v._seconds) return new Date(v._seconds * 1000);
+  if (v instanceof Date) return v;
+  return null;
+}
+
+// Envia un mensaje automatico respetando horario + tope diario.
+// Devuelve 'ok' | 'fuera_horario' | 'tope_alcanzado' | 'no_conectado' | 'error'
+async function enviarMensajeAutomatico(empresaId, numero, texto) {
+  const sesion = sesiones.get(empresaId);
+  if (!sesion || sesion.status !== 'connected') return 'no_conectado';
+  if (!dentroHorarioPermitido()) return 'fuera_horario';
+  if (!(await puedeEnviarHoy(empresaId))) return 'tope_alcanzado';
+  try {
+    const jid = numero.includes('@') ? numero : `${numero}@s.whatsapp.net`;
+    await sesion.sock.sendMessage(jid, { text: texto });
+    return 'ok';
+  } catch (e) {
+    console.error(`[${empresaId}] enviarMensajeAutomatico:`, e.message);
+    return 'error';
+  }
+}
+
+// ── Recordatorios de citas — 24h antes (Plan Pro) ─────────────
+async function revisarRecordatorios() {
+  if (!dentroHorarioPermitido()) return;
+
+  for (const [empresaId, sesion] of sesiones) {
+    if (sesion.status !== 'connected') continue;
+
+    try {
+      const empSnap = await db.collection('empresas').doc(empresaId).get();
+      const emp = empSnap.data();
+      if (!emp || emp.planActivo !== true) continue;
+
+      const plan = emp.planWasapbot || emp.plan;
+      if (plan !== 'pro') continue; // recordatorios: solo Plan Pro
+
+      const ahora  = Date.now();
+      const desde  = ahora + 23 * 3600000; // entre 23h
+      const hasta  = ahora + 25 * 3600000; // y 25h desde ahora
+
+      const citasSnap = await db.collection('empresas').doc(empresaId)
+        .collection('citas')
+        .where('recordatorioEnviado', '==', false)
+        .limit(50)
+        .get();
+
+      for (const doc of citasSnap.docs) {
+        const cita = doc.data();
+        if (!['pendiente', 'confirmada'].includes(cita.estado)) continue;
+        if (!cita.telefono) continue;
+
+        const fh = toDateFlexible(cita.fechaHora);
+        if (!fh) continue;
+        const t = fh.getTime();
+        if (t < desde || t > hasta) continue;
+
+        const nombre = cita.nombreCliente || 'cliente';
+        const texto =
+          `👋 Hola ${nombre}, te recordamos tu cita en *${emp.nombreEmpresa}*:\n\n` +
+          `📋 ${cita.servicio || 'Servicio'}\n` +
+          `📅 ${cita.fecha || ''} a las ${cita.hora || ''}\n\n` +
+          `Si necesitas reprogramar o cancelar, respóndenos por este chat. ¡Te esperamos! 😊`;
+
+        const resultado = await enviarMensajeAutomatico(empresaId, cita.telefono, texto);
+
+        if (resultado === 'ok') {
+          await doc.ref.update({ recordatorioEnviado: true, recordatorioEnviadoEn: FieldValue.serverTimestamp() });
+          console.log(`[${empresaId}] Recordatorio enviado -> ${cita.telefono}`);
+          await delayAleatorio();
+        } else if (resultado === 'tope_alcanzado' || resultado === 'fuera_horario') {
+          // No seguir intentando con esta empresa en esta ronda
+          break;
+        }
+        // 'no_conectado' / 'error' -> simplemente continua con la siguiente cita
+      }
+    } catch (e) {
+      console.error(`[${empresaId}] revisarRecordatorios:`, e.message);
+    }
+  }
+}
+
+// ── Seguimiento post-servicio — 2 a 5h despues (Plan Estandar y Pro) ──
+async function revisarSeguimientos() {
+  if (!dentroHorarioPermitido()) return;
+
+  for (const [empresaId, sesion] of sesiones) {
+    if (sesion.status !== 'connected') continue;
+
+    try {
+      const empSnap = await db.collection('empresas').doc(empresaId).get();
+      const emp = empSnap.data();
+      if (!emp || emp.planActivo !== true) continue;
+
+      const plan = emp.planWasapbot || emp.plan;
+      if (!['estandar', 'pro'].includes(plan)) continue; // seguimiento: Estandar y Pro
+
+      const ahora = Date.now();
+      const desde = ahora - 5 * 3600000; // completada hace 5h
+      const hasta = ahora - 2 * 3600000; // hasta hace 2h
+
+      const citasSnap = await db.collection('empresas').doc(empresaId)
+        .collection('citas')
+        .where('seguimientoEnviado', '==', false)
+        .limit(50)
+        .get();
+
+      for (const doc of citasSnap.docs) {
+        const cita = doc.data();
+        if (cita.estado !== 'completada') continue;
+        if (!cita.telefono) continue;
+
+        const ce = toDateFlexible(cita.completadoEn);
+        if (!ce) continue;
+        const t = ce.getTime();
+        if (t < desde || t > hasta) continue;
+
+        const nombre = cita.nombreCliente || 'cliente';
+        const texto =
+          `Hola ${nombre} 👋 Gracias por visitarnos en *${emp.nombreEmpresa}*.\n\n` +
+          `¿Cómo te fue con ${cita.servicio || 'tu servicio'}? Nos encantaría saber tu opinión — ` +
+          `y si necesitas algo más, aquí estamos para ayudarte 🙏`;
+
+        const resultado = await enviarMensajeAutomatico(empresaId, cita.telefono, texto);
+
+        if (resultado === 'ok') {
+          await doc.ref.update({ seguimientoEnviado: true, seguimientoEnviadoEn: FieldValue.serverTimestamp() });
+          console.log(`[${empresaId}] Seguimiento enviado -> ${cita.telefono}`);
+          await delayAleatorio();
+        } else if (resultado === 'tope_alcanzado' || resultado === 'fuera_horario') {
+          break;
+        }
+      }
+    } catch (e) {
+      console.error(`[${empresaId}] revisarSeguimientos:`, e.message);
+    }
+  }
+}
+
+async function correrTareasAutomaticas() {
+  await revisarRecordatorios().catch(e => console.error('revisarRecordatorios:', e.message));
+  await revisarSeguimientos().catch(e => console.error('revisarSeguimientos:', e.message));
+}
+
+// ══════════════════════════════════════════════════════════════
 //  RUTAS
 // ══════════════════════════════════════════════════════════════
 
@@ -375,9 +569,25 @@ app.post('/enviar', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Endpoint manual para forzar la revision de recordatorios/seguimientos
+//    (util para pruebas — en produccion corre solo via setInterval) ──
+app.post('/admin/revisar-automaticos', authMiddleware, async (req, res) => {
+  try {
+    await correrTareasAutomaticas();
+    res.json({ ok: true, ejecutado: true, horaPermitida: dentroHorarioPermitido() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, async () => {
-  console.log(`\nagencIAme WhatsApp Server v3 en puerto ${PORT}`);
+  console.log(`\nagencIAme WhatsApp Server v4 en puerto ${PORT}`);
   console.log(`API Vercel: ${AGENCIAME_API}`);
   console.log(`Secret: ${SERVER_SECRET ? 'OK' : 'FALTA'}`);
   await restaurarSesiones();
+
+  // Esperar 1 minuto a que las sesiones reconecten antes de la primera corrida
+  setTimeout(() => {
+    correrTareasAutomaticas();
+    // Cada 15 minutos
+    setInterval(correrTareasAutomaticas, 15 * 60 * 1000);
+  }, 60000);
 });
